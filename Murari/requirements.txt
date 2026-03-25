@@ -1,0 +1,13 @@
+flask
+flask_sqlalchemy
+flask_login
+pathvalidate
+ollama
+piper-tts
+onnxruntime
+opencv-python
+numpy
+tensorflow
+scikit-learn
+pillow
+gunicorn

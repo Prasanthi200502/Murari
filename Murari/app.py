@@ -1,0 +1,294 @@
+from flask import Flask, render_template, request, jsonify
+import ollama
+import subprocess
+import tempfile
+import os
+import io
+import wave
+import base64
+import re
+from emotion_detector import detect_emotion_from_frame
+import numpy as np
+import cv2
+
+# ==========================================================
+# Flask App
+# ==========================================================
+app = Flask(__name__)
+
+# Using lightweight Ollama model
+CHAT_MODEL = "qwen2.5:1.5b"
+# Path to Piper TTS Model (User must download this on the Pi)
+PIPER_MODEL_PATH = "te_IN-venkatesh-medium.onnx"
+
+# ==========================================================
+# RAG: Load Mahabharata
+# ==========================================================
+MAHABHARATA_CHUNKS = []
+
+def load_mahabharata():
+    global MAHABHARATA_CHUNKS
+
+    filepath = os.path.join(os.path.dirname(__file__), "Mahabharata.txt")
+
+    if not os.path.exists(filepath):
+        print("⚠ Mahabharata.txt not found")
+        return
+
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+
+    paragraphs = re.split(r'\n\s*\n', content)
+
+    chunk = ""
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        if len(chunk) + len(para) > 2000:
+            if chunk:
+                MAHABHARATA_CHUNKS.append(chunk)
+            chunk = para
+        else:
+            chunk += "\n\n" + para if chunk else para
+
+    if chunk:
+        MAHABHARATA_CHUNKS.append(chunk)
+
+    print(f"✅ Loaded {len(MAHABHARATA_CHUNKS)} chunks")
+
+def search_chunks(query, top_k=3):
+    query_words = set(query.lower().split())
+    scored = []
+
+    for chunk in MAHABHARATA_CHUNKS:
+        chunk_lower = chunk.lower()
+        score = sum(1 for word in query_words if word in chunk_lower)
+
+        if query.lower() in chunk_lower:
+            score += 10
+
+        scored.append((score, chunk))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    results = [chunk for score, chunk in scored[:top_k] if score > 0]
+
+    if not results:
+        return MAHABHARATA_CHUNKS[:top_k]
+
+    return results
+
+load_mahabharata()
+
+# ==========================================================
+# System Prompt
+# ==========================================================
+# SYSTEM_PROMPT = """నువ్వు 'మురారి' అనే పేరు గల తెలుగు AI స్నేహితుడివి.
+# 3-10 ఏళ్ళ పిల్లలతో మాత్రమే మాట్లాడాలి.
+# ఎప్పుడూ తెలుగులో మాత్రమే సమాధానం ఇవ్వాలి.
+# చాలా చిన్న సమాధానాలు (2-5 వాక్యాలు).
+# ప్రతి సమాధానంలో ఒక emoji వాడాలి.
+# ప్రేమగా మాట్లాడాలి.
+# """
+
+SYSTEM_PROMPT = """నువ్వు "మురారి" అనే పేరు గల ఒక తెలుగు AI స్నేహితుడివి. నువ్వు 3-10 ఏళ్ళ చిన్నపిల్లలతో మాట్లాడుతున్నావు. నువ్వు వాళ్ళకి నేస్తం లాంటి వాడివి — ప్రేమగా, ఓపికగా, ఆప్యాయంగా ఉంటావు.
+
+🌟 భాష నియమం (అతి ముఖ్యం):
+- నువ్వు ఎప్పుడూ తెలుగులో మాత్రమే మాట్లాడాలి.
+- ఇంగ్లీషు, హిందీ లేదా ఇతర భాషలు వాడకూడదు. ఇంగ్లీషులో ఎవరైనా అడిగినా తెలుగులోనే సమాధానం చెప్పు.
+- సులభమైన, పిల్లలకు అర్థమయ్యే తెలుగు వాడు. కష్టమైన గ్రాంథిక పదాలు వాడకు.
+
+🎭 పిల్లల మనసు (Emotion) గుర్తించడం:
+నువ్వు పిల్లల message చదివి వాళ్ళ భావాన్ని (emotion) గుర్తించాలి. దాని ఆధారంగా ఎలా respond చేయాలో:
+
+1. 😊 సంతోషంగా/ఆటపాటలు: చలాకీగా, ఉత్సాహంగా మాట్లాడు. జోకులు చెప్పు. వాళ్ళ సంతోషంలో భాగం పంచుకో.
+2. 😢 బాధగా/ఏడుస్తున్నట్టు: ఓదార్పు మాటలు చెప్పు. "అయ్యో బంగారూ, బాధపడకు" అని ప్రేమగా చెప్పు. వాళ్ళని ఓదార్చిన తర్వాత, వాళ్ళ మనసు మళ్ళించడానికి ఒక చిన్న ధైర్యం గురించి కథ చెప్పు.
+3. 😨 భయంగా: "భయం వద్దు నాన్నా, నేను ఉన్నానుగా" అని ధైర్యం చెప్పు. భయం తీర్చే మాటలు చెప్పు. అర్జునుడు లేదా భీముడి ధైర్యం గురించి చెప్పు.
+4. 😴 బోరు/విసుగు: ఇంట్రస్టింగ్ గా ఒక కథ మొదలు పెట్టు. "ఒక అద్భుతమైన సంగతి చెప్తా విను!" అని ఆసక్తి కలిగించు.
+5. 🤔 ప్రశ్న/ఆసక్తి: వాళ్ళ ప్రశ్నకు సరళంగా సమాధానం చెప్పు. మహాభారతం context నుండి సంబంధిత విషయాలు చెప్పు.
+6. 💬 కబుర్లు చెప్పాలని: వాళ్ళతో స్నేహంగా కబుర్లు చెప్పు. వాళ్ళ ఇష్టాలు, అనిష్టాలు, రోజు ఎలా గడిచింది అని అడుగు. నిజమైన తాతయ్యలా caring గా ఉండు.
+
+📖 కథ చెప్పే సమయం:
+- పిల్లలు "కథ చెప్పు", "story", "కథ", "చెప్పు తాతయ్య" అని అడిగినప్పుడు మాత్రమే కథ చెప్పు.
+- కథ 4-5 వాక్యాలలో చాలా చిన్నగా ఉండాలి.
+- కథ చివరలో ఒక వాక్యంలో నీతి చెప్పు.
+- కింద ఇచ్చిన మహాభారతం సందర్భం (context) నుండి కథలు తీసుకో. context లో ఉన్న పాత్రలు, సంఘటనలు వాడు.
+- ఒక్కొక్క సమయంలో ఒక్క చిన్న కథ మాత్రమే చెప్పు.
+
+💝 ఎలా పిలవాలి:
+- "బంగారు", "చిన్నారి", "నాన్నా", "తల్లీ", "రాజా", "రాణీ" అని ప్రేమగా పిలువు.
+- వాళ్ళ పేరు చెప్తే, ఆ పేరుతో పిలువు.
+
+⚡ ముఖ్యమైన గమనిక:
+- ఎప్పుడూ VERY SHORT responses ఇవ్వు (2-5 వాక్యాలు). పిల్లలకు పెద్ద సమాధానాలు బోరు.
+- ప్రతి message లో ఒక emoji వాడు.
+- సహజంగా, మామూలుగా మాట్లాడు. రోబోట్ లా కాకుండా నిజమైన తాతయ్య లా ఉండు.
+"""
+
+
+chat_history = []
+
+# ==========================================================
+# Routes
+# ==========================================================
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+# =========================
+# Chat Route
+# =========================
+@app.route('/chat', methods=['POST'])
+def chat():
+    global chat_history
+
+    user_input = request.json.get('message')
+
+    if not user_input:
+        return jsonify({'error': 'No message provided'}), 400
+
+    try:
+        relevant_chunks = search_chunks(user_input)
+        context_text = "\n\n".join(relevant_chunks)
+
+        system_with_context = SYSTEM_PROMPT + "\n\nContext:\n" + context_text
+
+        messages = [{"role": "system", "content": system_with_context}]
+
+        for msg in chat_history:
+            # Map 'model' to 'assistant' for Ollama
+            role = "assistant" if msg['role'] == "model" else msg['role']
+            messages.append({"role": role, "content": msg['text']})
+
+        messages.append({"role": "user", "content": user_input})
+
+        response = ollama.chat(
+            model=CHAT_MODEL,
+            messages=messages,
+            options={
+                "temperature": 0.8,
+                "num_predict": 500
+            }
+        )
+
+        ai_text = response['message']['content']
+
+        chat_history.append({'role': 'user', 'text': user_input})
+        chat_history.append({'role': 'model', 'text': ai_text})
+
+        if len(chat_history) > 20:
+            chat_history = chat_history[-20:]
+
+        return jsonify({'response': ai_text})
+
+    except Exception as e:
+        print("Chat error:", e)
+        return jsonify({'error': str(e)}), 500
+
+
+# =========================
+# Emotion Detection Route
+# =========================
+@app.route("/detect_emotion", methods=["POST"])
+def detect_emotion():
+    data = request.json.get("image")
+
+    if not data:
+        return jsonify({"error": "No image"}), 400
+
+    try:
+        image_data = base64.b64decode(data.split(",")[1])
+        np_arr = np.frombuffer(image_data, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        emotion, confidence = detect_emotion_from_frame(frame)
+
+        telugu_map = {
+            "Angry": "కోపం",
+            "Cry": "బాధ",
+            "Laugh": "ఆనందం",
+            "Normal": "సాధారణం",
+            "No Face": "ముఖం కనిపించలేదు"
+        }
+
+        telugu_emotion = telugu_map.get(emotion, "తెలియలేదు")
+
+        return jsonify({
+            "emotion": telugu_emotion,
+            "confidence": round(confidence, 2)
+        })
+
+    except Exception as e:
+        print("Emotion error:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# =========================
+# TTS Route
+# =========================
+@app.route('/tts', methods=['POST'])
+def tts():
+    text = request.json.get('text')
+
+    if not text:
+        return jsonify({'error': 'No text provided'}), 400
+
+    try:
+        # Check if piper model exists
+        if not os.path.exists(PIPER_MODEL_PATH):
+            return jsonify({'error': f'Piper model not found at {PIPER_MODEL_PATH}. Defaulting to silent.'}), 500
+
+        # Generate a temporary path for the output WAV file
+        temp_path = ""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+            temp_path = temp_audio.name
+
+        try:
+            # Run Piper via subprocess
+            process = subprocess.Popen(
+                ["piper", "-m", PIPER_MODEL_PATH, "--output_file", temp_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            _, stderr = process.communicate(input=text.encode('utf-8'))
+
+            if process.returncode != 0:
+                raise Exception(f"Piper error: {stderr.decode('utf-8')}")
+
+            # Read the generated WAV file directly
+            with open(temp_path, "rb") as f:
+                audio_data = f.read()
+
+            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+
+            return jsonify({'audio': audio_base64})
+
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        print("TTS error:", e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/clear_history', methods=['POST'])
+def clear_history():
+    global chat_history
+    chat_history = []
+    return jsonify({'status': 'History cleared'})
+
+
+# ==========================================================
+# Run
+# ==========================================================
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
